@@ -1,0 +1,254 @@
+# scripts/make_tuned_ridge.py
+import os, sys, json, argparse, random
+from typing import List
+
+import torch
+import sys, os
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from src.util import load_model_and_tokenizer, get_device
+# --- Make sure we can import from src/ ---
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT))
+
+try:
+    from tqdm import tqdm
+except Exception:
+    # fallback if tqdm not installed
+    def tqdm(it, **kw): return it
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Build diagonal tuned-lens (gamma,beta per layer) via ridge to match x_L."
+    )
+    p.add_argument("--model", type=str, default="EleutherAI/gpt-neo-125M",
+                   help="HF model name (e.g., gpt2, gpt2-medium)")
+    p.add_argument("--out", type=str, default=os.path.join(ROOT, "data"),
+                   help="Output JSON path for tuned diag weights")
+    p.add_argument("--max_txt", type=int, default=800,
+                   help="Max number of prompts to use")
+    p.add_argument("--pos", type=int, default=-1,
+                   help="Position used when reading hidden states (usually -1)")
+    p.add_argument("--skip_embedding", action="store_true",
+                   help="If set, starts from block1 (drops embedding row). Recommended.")
+    p.add_argument("--lnf_mode", type=str, default="last_only",
+                   choices=["raw", "last_only", "all"],
+                   help="Apply ln_f to last layer only (recommended), or raw/all.")
+    p.add_argument("--l2", type=float, default=1e-4,
+                   help="Ridge strength (lambda)")
+    p.add_argument("--seed", type=int, default=422)
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--remote", default=False)
+    return p.parse_args()
+def _resolve_attr(obj, path):
+    cur = obj
+    for part in path.split("."):
+        if cur is None or not hasattr(cur, part):
+            return None
+        cur = getattr(cur, part)
+    return cur
+@torch.no_grad()
+def compute_layer_gains(model, tokenizer, texts, layers_json, pos=-1, skip_embedding=True, lnf_mode="last_only"):
+    device = next(model.parameters()).device
+    W_U = model.lm_head.weight.T
+    
+    ln_f = None
+    for cand in ("transformer.ln_f", "model.norm", "model.decoder.norm"):
+        ln_f = _resolve_attr(model, cand)
+        if ln_f is not None:
+            break
+    if ln_f is None:
+        lnf_mode_effective = "none"
+    else:
+        lnf_mode_effective = lnf_mode
+    gains = {}
+    for t in texts:
+        out = model(**tokenizer(t, return_tensors="pt").to(device))
+        hs = out.hidden_states
+        L = len(hs)-1
+        xL = hs[L][0, pos]
+        if ln_f is not None and lnf_mode_effective  in ("last_only","all"):
+            xL = ln_f(xL)
+        zL = xL @ W_U
+        start = 1 if skip_embedding else 0
+        for i in range(start, len(hs)):
+            key = str(i)
+            if key not in layers_json: 
+                continue
+            x = hs[i][0, pos]
+            if ln_f is not None and lnf_mode_effective =="all":
+                x = ln_f(x)
+            g = torch.tensor(layers_json[key]["gamma"], device=x.device)
+            b = torch.tensor(layers_json[key]["beta"],  device=x.device)
+            zt = (g * x + b) @ W_U
+            num = (zt * zL).sum()
+            den = (zt * zt).sum().clamp(min=1e-12)
+            a = float(num / den)
+            gains.setdefault(key, []).append(a)
+    # Avg
+    return {k: float(sum(v)/len(v)) for k,v in gains.items() if v}
+
+@torch.no_grad()
+def collect_pairs(model, tokenizer, texts: List[str], pos=-1,
+                  skip_embedding=True, lnf_mode="last_only"):
+    """
+    For each prompt, collect (x_l, x_L) pairs at the same position.
+    Returns: list of dicts per layer: {"X":[N,d], "Y":[N,d]}, start_index
+    """
+    device = next(model.parameters()).device
+    model.eval()
+
+    pairs_per_layer = None
+    start = None
+
+    for t in tqdm(texts, desc="collect"):
+        inp = tokenizer(t, return_tensors="pt").to(device)
+        out = model(**inp)
+        hs = out.hidden_states                 # [emb, h1, ..., hL]
+        ln_f = None
+        for cand in ("transformer.ln_f", "model.norm", "model.decoder.norm"):
+            ln_f = _resolve_attr(model, cand)
+            if ln_f is not None:
+                break
+        if ln_f is None:
+            lnf_mode_effective = "none"
+        else:
+            lnf_mode_effective = lnf_mode
+        L = len(hs) - 1
+        s = 1 if skip_embedding else 0
+        if start is None:
+            start = s
+
+        # Target = last hidden (optionally with ln_f) — matches standard logits path
+        xL = hs[L][0, pos]
+        if ln_f is not None and lnf_mode_effective in ("last_only", "all"):
+            xL = ln_f(xL)
+
+        for i in range(s, len(hs)):
+            xi = hs[i][0, pos]
+            # Note: we usually DO NOT apply ln_f to middle layers unless lnf_mode=='all'
+            if ln_f is not None and lnf_mode_effective == "all":
+                xi = ln_f(xi)
+
+            if pairs_per_layer is None:
+                d = xi.shape[-1]
+                K = len(hs) - s
+                pairs_per_layer = [{"X": [], "Y": []} for _ in range(K)]
+            li = i - s
+            pairs_per_layer[li]["X"].append(xi.detach().cpu())
+            pairs_per_layer[li]["Y"].append(xL.detach().cpu())
+
+    # stack
+    for li in range(len(pairs_per_layer)):
+        pairs_per_layer[li]["X"] = torch.stack(pairs_per_layer[li]["X"], dim=0)  # [N,d]
+        pairs_per_layer[li]["Y"] = torch.stack(pairs_per_layer[li]["Y"], dim=0)  # [N,d]
+    return pairs_per_layer, start
+
+
+def fit_diag_ridge(X: torch.Tensor, Y: torch.Tensor, l2=1e-4):
+    """
+    Solve, per-dimension j:
+        min_{gamma_j, beta_j} || gamma_j X_j + beta_j - Y_j ||^2 + l2 * gamma_j^2
+    Closed form (ridge on slope only):
+        gamma = Cov(X,Y) / (Var(X) + l2)
+        beta  = mean(Y) - gamma * mean(X)
+    X, Y: [N, d] (float tensors on CPU)
+    """
+    Xm = X.mean(0)
+    Ym = Y.mean(0)
+    Xc = X - Xm
+    Yc = Y - Ym
+    num = (Xc * Yc).sum(0)                 # covariance numerator [d]
+    den = (Xc * Xc).sum(0) + float(l2)     # variance + lambda     [d]
+    gamma = num / den
+    beta  = Ym - gamma * Xm
+    return gamma, beta
+
+
+def main():
+    args = parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    # load model
+    device = get_device()
+    model_path = args.model.replace("/", "__")
+    model, tokenizer = load_model_and_tokenizer(args.model, device,args.remote)
+    model.config.output_hidden_states = True
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    # load prompts
+    texts = []
+    prompt_path=os.path.join(ROOT, "data",model_path, "prompt_pool.json")
+    if os.path.isfile(prompt_path):
+        try:
+            data = json.load(open(prompt_path, "r", encoding="utf-8"))
+            # accept list of dicts with "question"n" or list of strings
+            if isinstance(data, list) and data and isinstance(data[0], dict) and "question" in data[0]:
+                merged = []
+                for d in data:
+                    q = d.get("question", "")
+                    opts = d.get("options", None)
+                    if isinstance(q, str) and q.strip() and isinstance(opts, list) and len(opts) > 0:
+                        for o in opts:
+                            if isinstance(o, str) and o.strip():
+                 
+                                merged.append(q + " " + o)
+               
+                texts = list(dict.fromkeys(texts + merged)) 
+        except Exception as e:
+            print("[warn] could not read prompts file:", e)
+
+    if not texts:
+        # fallback tiny set (better to provide a real prompts file)
+        texts = [
+            "The capital of France is ",
+            "In 2010, a key idea in computer science was ",
+            "Compute 5 + 7 = ",
+            "Opposite of cold is ",
+            "In Python, write a one-liner to reverse a list: "
+        ] * 200
+
+    texts = texts[: args.max_txt]
+    if args.debug:
+        print(f"[info] using {len(texts)} prompts from: {prompt_path}")
+
+    # collect pairs (x_l, x_L)
+    pairs, start = collect_pairs(
+        model, tokenizer, texts, pos=args.pos,
+        skip_embedding=args.skip_embedding, lnf_mode=args.lnf_mode
+    )
+
+    # fit ridge per layer
+    layers_json = {}
+    for li, buf in enumerate(pairs):
+        X, Y = buf["X"], buf["Y"]     # [N,d] on CPU
+        gamma, beta = fit_diag_ridge(X, Y, l2=args.l2)
+        layers_json[str(li + start)] = {
+            "gamma": gamma.tolist(),
+            "beta":  beta.tolist(),
+        }
+    alphas = compute_layer_gains(model, tokenizer, texts, layers_json,
+                             pos=args.pos, skip_embedding=args.skip_embedding, lnf_mode=args.lnf_mode)
+    for k, a in alphas.items():
+        layers_json[k]["alpha"] = a
+    print("[info] layer gains (sample):", list(alphas.items())[:5])
+
+    # save
+
+    
+    out_path=os.path.join(args.out,model_path,"tuned_diag.json")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"layers": layers_json}, f)
+    print(f"[OK] saved tuned diag -> {out_path}")
+    print(f"    layers: {list(layers_json.keys())[:5]} ...")
+    print(f"    mode: lnf={args.lnf_mode}, skip_embedding={args.skip_embedding}, l2={args.l2}, N={len(texts)}")
+
+
+if __name__ == "__main__":
+    main()
